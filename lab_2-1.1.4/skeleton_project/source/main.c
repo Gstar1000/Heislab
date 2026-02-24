@@ -1,83 +1,143 @@
-// #include <stdio.h>
-// #include <stdlib.h>
-// #include <signal.h>
-// #include <time.h>
-// #include "driver/elevio.h"
-// #include <stdbool.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <signal.h>
+#include <time.h>
+#include "driver/elevio.h"
+#include <stdbool.h>
 
 
 
-// int main(){
-//     elevio_init();
+static double now_s(void){
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (double)ts.tv_sec + (double)ts.tv_nsec * 1e-9;
+}
 
-//     orders_init();
+// --------------------
+// Tilstander
+// --------------------
+typedef enum {
+    ST_IDLE,
+    ST_MOVING,
+    ST_DOOR_OPEN,
+    ST_STOP_HELD
+} State;
 
-//     MotorDirection dir = DIRN_STOP;
+int main(void){
+    elevio_init();
 
-//     while(1){
+    orders_init();
 
-//         // 1️⃣ Les nye knapper og legg inn ordre
-//         orders_poll_buttons(false);
+    State state = ST_IDLE;
+    MotorDirection dir = DIRN_STOP;
 
-//         // 2️⃣ Oppdater bestillingslys
-//         lights_set_order_lamps_from_orders();
+    int lastFloor = 0;            // sist kjente etasje (0..3)
+    double door_deadline = 0.0;   // når døra skal lukkes
 
-//         // 3️⃣ Les etasjesensor
-//         int floor = elevio_floorSensor();
+    // Sørg for at motor ikke kjører ved start
+    elevio_motorDirection(DIRN_STOP);
+    lights_set_door_open_lamp(false);
+    lights_set_stop_lamp(false);
 
-//         if(floor != -1){
-//             lights_set_floor_indicator(floor);
+    while(1){
 
-//             // 4️⃣ Sjekk om vi skal stoppe her
-//             if(orders_should_stop(floor, dir)){
-//                 elevio_motorDirection(DIRN_STOP);
-//                 orders_clear_at_floor(floor);
+        // ---- Les sensorer
+        int floor = elevio_floorSensor();
+        if(floor != -1){
+            lastFloor = floor;
+            lights_set_floor_indicator(floor);
+        }
 
-//                 lights_set_door_open_lamp(true);
-//                 // Her bør du egentlig ha en 3 sek timer
-//             }
-//         }
+        bool stopPressed = elevio_stopButton();
+        bool obstructed  = elevio_obstruction();
 
-//         // 5️⃣ Velg ny retning hvis vi ikke stopper
-//         dir = orders_next_dir(floor, dir);
-//         elevio_motorDirection(dir);
-//     }
-//     // printf("=== Example Program ===\n");
-//     // printf("Press the stop button on the elevator panel to exit\n");
-//     // while(startup()!=true){}
+        // ---- STOPP: høyest prioritet
+        if(stopPressed){
+            lights_set_stop_lamp(true);
+            elevio_motorDirection(DIRN_STOP);
+            orders_clear_all();
 
-//     // while(1){
-//     //     int floor = elevio_floorSensor();
+            // Hvis i etasje: hold døra åpen mens STOPP holdes
+            if(floor != -1){
+                lights_set_door_open_lamp(true);
+                state = ST_STOP_HELD;
+            } else {
+                state = ST_STOP_HELD; // mellom etasjer: bare stå stille
+            }
 
-//     //     if(floor == 0){
-//     //         elevio_motorDirection(DIRN_UP);
-//     //     }
+        } else if(state == ST_STOP_HELD){
+            // STOPP sluppet:
+            lights_set_stop_lamp(false);
 
-//     //     if(floor == N_FLOORS-1){
-//     //         elevio_motorDirection(DIRN_DOWN);
-//     //     }
+            // Hvis vi står i en etasje når stop slippes:
+            if(floor != -1){
+                // Start 3 sek dør-timer (hold åpen)
+                lights_set_door_open_lamp(true);
+                door_deadline = now_s() + 3.0;
+                state = ST_DOOR_OPEN;
+            } else {
+                // Mellom etasjer: gå til normal styring
+                lights_set_door_open_lamp(false);
+                state = ST_IDLE;
+            }
+        }
 
+        // Hvis vi er i STOP_HELD, gjør ingenting annet i denne iterasjonen
+        if(state == ST_STOP_HELD){
+            continue;
+        }
 
-//     //     for(int f = 0; f < N_FLOORS; f++){
-//     //         for(int b = 0; b < N_BUTTONS; b++){
-//     //             int btnPressed = elevio_callButton(f, b);
-//     //             elevio_buttonLamp(f, b, btnPressed);
-//     //         }
-//     //     }
+        // ---- Poll knapper og oppdater ordrelys (ignorer hvis døra er åpen? valgfritt)
+        orders_poll_buttons(false);
+        lights_set_order_lamps_from_orders();
 
-//     //     if(elevio_obstruction()){
-//     //         elevio_stopLamp(1);
-//     //     } else {
-//     //         elevio_stopLamp(0);
-//     //     }
-        
-//     //     if(elevio_stopButton()){
-//     //         elevio_motorDirection(DIRN_STOP);
-//     //         break;
-//     //     }
-        
-//     //     nanosleep(&(struct timespec){0, 20*1000*1000}, NULL);
-//     // }
+        // ---- Dørtilstand: motor skal alltid stå stille
+        if(state == ST_DOOR_OPEN){
+            elevio_motorDirection(DIRN_STOP);
 
-//     return 0;
-// }
+            // Obstruksjon: forleng døra mens hindring finnes
+            if(obstructed){
+                door_deadline = now_s() + 3.0;
+            }
+
+            // Når tiden er ute og ingen obstruksjon: lukk døra
+            if(now_s() >= door_deadline && !obstructed){
+                lights_set_door_open_lamp(false);
+
+                // Etter lukking: velg om vi skal kjøre eller idle
+                dir = orders_next_dir(lastFloor, DIRN_STOP);
+                state = (dir == DIRN_STOP) ? ST_IDLE : ST_MOVING;
+            }
+
+            continue; // viktig: ikke kjør motorvalg nedenfor
+        }
+
+        // ---- Normal logikk (IDLE / MOVING)
+        // Hvis vi er i en etasje og skal stoppe her:
+        if(floor != -1 && orders_should_stop(floor, dir)){
+            elevio_motorDirection(DIRN_STOP);
+            orders_clear_at_floor(floor);
+            lights_set_order_lamps_from_orders();
+
+            // Åpne dør i 3 sek
+            lights_set_door_open_lamp(true);
+            door_deadline = now_s() + 3.0;
+            state = ST_DOOR_OPEN;
+
+            continue; // viktig: ikke overskriv motoren etter stopp
+        }
+
+        // Velg retning basert på siste kjente etasje
+        MotorDirection next = orders_next_dir(lastFloor, dir);
+
+        if(next == DIRN_STOP){
+            elevio_motorDirection(DIRN_STOP);
+            dir = DIRN_STOP;
+            state = ST_IDLE;
+        } else {
+            elevio_motorDirection(next);
+            dir = next;
+            state = ST_MOVING;
+        }
+    }
+}
