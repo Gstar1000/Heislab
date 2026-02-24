@@ -93,5 +93,6 @@ int main() {
         if(door_is_open){
             elevio_motorDirection(DIRN_STOP);
         }
+        nanosleep(&(struct timespec){0, 20*1000*1000}, NULL);
     }
 }

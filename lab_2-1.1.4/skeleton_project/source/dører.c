@@ -25,7 +25,7 @@ bool door_update(Door* d,
             break;
         
         case DOOR_OPEN:
-            if(elevio_stopButton || elevio_obstruction){
+            if(stop_pressed || obstruction){
                 d->t0 = now;
             }
             else if(now - d->t0 >= d->open_time_s){
