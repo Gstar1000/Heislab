@@ -1,4 +1,8 @@
-#include "elevio.h"
+#ifndef STARTUP_H
+#define STARTUP_H
+
 #include <stdbool.h>
 
-bool startup_status(void);
+bool startup(void);
+
+#endif
