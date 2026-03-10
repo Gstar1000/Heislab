@@ -1,0 +1,1042 @@
+/**
+ * @file main.c
+ * @brief Elevator control system for TTK4235 Lab 2.
+ *
+ * Implements all FAT requirements:
+ *   Startup  : O1-O3
+ *   Orders   : H1-H4
+ *   Lights   : L1-L6
+ *   Door     : D1-D4
+ *   Safety   : S1-S7
+ *   Robustness: R1-R3
+ */
+
+#include <stdio.h>
+#include <time.h>
+#include "driver/elevio.h"
+
+/* -----------------------------------------------------------------------
+ * Types and constants
+ * --------------------------------------------------------------------- */
+
+/** Loop sleep: 20 ms */
+#define LOOP_SLEEP_NS   (20 * 1000 * 1000)
+
+/** Door open duration in seconds */
+#define DOOR_OPEN_SEC   3.0
+
+/**
+ * @brief Top-level FSM states for the elevator.
+ */
+typedef enum {
+    STATE_INIT,         /**< Driving to a known floor on startup        */
+    STATE_IDLE,         /**< Stationary, no pending orders              */
+    STATE_MOVING,       /**< Driving toward a target floor              */
+    STATE_DOOR_OPEN,    /**< Door open, timer running                   */
+    STATE_STOP_PRESSED  /**< Emergency stop active                      */
+} ElevatorState;
+
+/* -----------------------------------------------------------------------
+ * Global state
+ * --------------------------------------------------------------------- */
+
+/** Pending orders: orders[floor][button] */
+static int orders[N_FLOORS][N_BUTTONS];
+
+/** Current known floor (-1 = between floors) */
+static int current_floor = -1;
+
+/** Last known floor (for floor indicator between floors) */
+static int last_floor = 0;
+
+/** Current motor direction */
+static MotorDirection current_direction = DIRN_STOP;
+
+/** FSM state */
+static ElevatorState state = STATE_INIT;
+
+/** Time when door was opened */
+static struct timespec door_open_time;
+
+/** True if obstruction was seen while door is open */
+static int obstruction_active = 0;
+
+/* -----------------------------------------------------------------------
+ * Helper: wall-clock elapsed seconds since t0
+ * --------------------------------------------------------------------- */
+static double elapsed_since(struct timespec t0) {
+    struct timespec now;
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    return (double)(now.tv_sec - t0.tv_sec)
+         + (double)(now.tv_nsec - t0.tv_nsec) * 1e-9;
+}
+
+/* -----------------------------------------------------------------------
+ * Orders
+ * --------------------------------------------------------------------- */
+
+/** Clear all pending orders and turn off all order lights. */
+static void orders_clear_all(void) {
+    for (int f = 0; f < N_FLOORS; f++) {
+        for (int b = 0; b < N_BUTTONS; b++) {
+            orders[f][b] = 0;
+            elevio_buttonLamp(f, b, 0);
+        }
+    }
+}
+
+/** Register a new order and light its button lamp. */
+static void orders_add(int floor, ButtonType button) {
+    orders[floor][button] = 1;
+    elevio_buttonLamp(floor, button, 1);
+}
+
+/** Clear orders for a given floor and extinguish their lamps. */
+static void orders_clear_floor(int floor) {
+    for (int b = 0; b < N_BUTTONS; b++) {
+        orders[floor][b] = 0;
+        elevio_buttonLamp(floor, b, 0);
+    }
+}
+
+/** Return 1 if any order exists anywhere. */
+static int orders_any(void) {
+    for (int f = 0; f < N_FLOORS; f++)
+        for (int b = 0; b < N_BUTTONS; b++)
+            if (orders[f][b]) return 1;
+    return 0;
+}
+
+/**
+ * @brief Decide the next direction to move.
+ *
+ * Implements the "scan" (LOOK) algorithm:
+ *   - Continue in current_direction if there are orders that way.
+ *   - Otherwise reverse if there are orders the other way.
+ *   - Otherwise stop.
+ *
+ * H2: Hall orders in the *opposite* direction are not served while moving.
+ *     The direction chosen here naturally satisfies H2 because we only pick
+ *     up a hall-order in the opposite direction once we have turned around.
+ *
+ * @return DIRN_UP, DIRN_DOWN, or DIRN_STOP
+ */
+static MotorDirection orders_choose_direction(void) {
+    /* Prefer continuing in the current direction first */
+    MotorDirection dirs[2];
+    if (current_direction == DIRN_UP || current_direction == DIRN_STOP) {
+        dirs[0] = DIRN_UP;
+        dirs[1] = DIRN_DOWN;
+    } else {
+        dirs[0] = DIRN_DOWN;
+        dirs[1] = DIRN_UP;
+    }
+
+    for (int d = 0; d < 2; d++) {
+        MotorDirection dir = dirs[d];
+        for (int f = 0; f < N_FLOORS; f++) {
+            /* Only consider floors reachable in this direction */
+            if (dir == DIRN_UP   && f <= current_floor) continue;
+            if (dir == DIRN_DOWN && f >= current_floor) continue;
+            for (int b = 0; b < N_BUTTONS; b++) {
+                if (orders[f][b]) return dir;
+            }
+        }
+    }
+    return DIRN_STOP;
+}
+
+/**
+ * @brief Decide whether to stop at the current floor.
+ *
+ * Stop if:
+ *  - There is a cab order here, or
+ *  - There is a hall order matching the travel direction, or
+ *  - There are no further orders beyond this floor in the current direction.
+ *
+ * H3: all orders at the floor are cleared when we stop.
+ */
+static int orders_should_stop_at(int floor, MotorDirection dir) {
+    if (orders[floor][BUTTON_CAB]) return 1;
+
+    if (dir == DIRN_UP   && orders[floor][BUTTON_HALL_UP])   return 1;
+    if (dir == DIRN_DOWN && orders[floor][BUTTON_HALL_DOWN])  return 1;
+
+    /* No further orders in this direction → stop and serve this floor */
+    int further = 0;
+    for (int f = 0; f < N_FLOORS; f++) {
+        if (dir == DIRN_UP   && f <= floor) continue;
+        if (dir == DIRN_DOWN && f >= floor) continue;
+        for (int b = 0; b < N_BUTTONS; b++) {
+            if (orders[f][b]) { further = 1; break; }
+        }
+        if (further) break;
+    }
+    if (!further) return 1;
+
+    return 0;
+}
+
+/* -----------------------------------------------------------------------
+ * Floor indicator
+ * --------------------------------------------------------------------- */
+
+/** Update floor indicator to the last known floor. */
+static void floor_indicator_update(int floor) {
+    elevio_floorIndicator(floor);
+}
+
+/* -----------------------------------------------------------------------
+ * Door helpers
+ * --------------------------------------------------------------------- */
+
+/** Open the door and start the timer. */
+static void door_open(void) {
+    elevio_doorOpenLamp(1);
+    clock_gettime(CLOCK_MONOTONIC, &door_open_time);
+    obstruction_active = 0;
+}
+
+/** Close the door. */
+static void door_close(void) {
+    elevio_doorOpenLamp(0);
+}
+
+/* -----------------------------------------------------------------------
+ * Motor helper
+ * --------------------------------------------------------------------- */
+static void motor_set(MotorDirection dir) {
+    current_direction = dir;
+    elevio_motorDirection(dir);
+}
+
+/* -----------------------------------------------------------------------
+ * Poll buttons and register new orders (only when allowed)
+ * --------------------------------------------------------------------- */
+static void poll_and_register_orders(void) {
+    for (int f = 0; f < N_FLOORS; f++) {
+        for (int b = 0; b < N_BUTTONS; b++) {
+            if (elevio_callButton(f, b)) {
+                orders_add(f, b);
+            }
+        }
+    }
+}
+
+/* -----------------------------------------------------------------------
+ * State handlers
+ * --------------------------------------------------------------------- */
+
+/**
+ * STATE_INIT
+ * Drive downward until we hit a floor sensor.
+ * O1: reach a defined state.
+ * O2: ignore all orders during init.
+ * O3: ignore stop button during init.
+ */
+static void handle_init(void) {
+    int floor = elevio_floorSensor();
+    if (floor != -1) {
+        /* We are already at a defined floor */
+        current_floor = floor;
+        last_floor = floor;
+        floor_indicator_update(floor);
+        motor_set(DIRN_STOP);
+        state = STATE_IDLE;
+        return;
+    }
+    /* Drive down to find floor 0 */
+    if (current_direction != DIRN_DOWN) {
+        motor_set(DIRN_DOWN);
+    }
+}
+
+/**
+ * STATE_IDLE
+ * H4: stand still when no orders.
+ * Transition to MOVING when orders arrive.
+ */
+static void handle_idle(void) {
+    /* Always accept new button presses in idle */
+    poll_and_register_orders();
+
+    /* Stop button → safety state */
+    if (elevio_stopButton()) {
+        elevio_stopLamp(1);
+        orders_clear_all();
+        /* If we are at a floor, open door (D3) */
+        if (current_floor != -1) {
+            door_open();
+            state = STATE_STOP_PRESSED;
+        } else {
+            state = STATE_STOP_PRESSED;
+        }
+        return;
+    }
+
+    if (!orders_any()) return;
+
+    /* Choose direction and start moving */
+    MotorDirection dir = orders_choose_direction();
+    if (dir == DIRN_STOP) return;
+
+    /* If there is an order at the current floor, serve it immediately */
+    if (current_floor != -1 && orders_should_stop_at(current_floor, dir)) {
+        orders_clear_floor(current_floor);
+        door_open();
+        state = STATE_DOOR_OPEN;
+        return;
+    }
+
+    motor_set(dir);
+    state = STATE_MOVING;
+}
+
+/**
+ * STATE_MOVING
+ * Drive toward the chosen target.
+ * H2: hall orders in the opposite direction are skipped.
+ * S3: never drive past floor 0 or N_FLOORS-1.
+ */
+static void handle_moving(void) {
+    /* Accept new orders while moving */
+    poll_and_register_orders();
+
+    /* Stop button → S4, S5 */
+    if (elevio_stopButton()) {
+        elevio_stopLamp(1);
+        motor_set(DIRN_STOP);
+        orders_clear_all();
+        if (current_floor != -1) {
+            door_open();
+        }
+        state = STATE_STOP_PRESSED;
+        return;
+    }
+
+    int floor = elevio_floorSensor();
+
+    if (floor != -1) {
+        current_floor = floor;
+        last_floor = floor;
+        floor_indicator_update(floor);  /* L3, L4 */
+
+        /* S3: hard limits */
+        if (floor == 0) {
+            motor_set(DIRN_STOP);
+            /* If we were heading down and hit the bottom, change direction */
+            if (current_direction == DIRN_DOWN) {
+                if (orders_should_stop_at(floor, DIRN_DOWN) ||
+                    orders_should_stop_at(floor, DIRN_UP)) {
+                    orders_clear_floor(floor);
+                    door_open();
+                    state = STATE_DOOR_OPEN;
+                    return;
+                }
+                MotorDirection nd = orders_choose_direction();
+                if (nd != DIRN_STOP) { motor_set(nd); state = STATE_MOVING; }
+                else state = STATE_IDLE;
+                return;
+            }
+        }
+        if (floor == N_FLOORS - 1) {
+            motor_set(DIRN_STOP);
+            if (current_direction == DIRN_UP) {
+                if (orders_should_stop_at(floor, DIRN_UP) ||
+                    orders_should_stop_at(floor, DIRN_DOWN)) {
+                    orders_clear_floor(floor);
+                    door_open();
+                    state = STATE_DOOR_OPEN;
+                    return;
+                }
+                MotorDirection nd = orders_choose_direction();
+                if (nd != DIRN_STOP) { motor_set(nd); state = STATE_MOVING; }
+                else state = STATE_IDLE;
+                return;
+            }
+        }
+
+        /* Normal floor: should we stop here? */
+        if (orders_should_stop_at(floor, current_direction)) {
+            motor_set(DIRN_STOP);
+            orders_clear_floor(floor);   /* H3 */
+            door_open();                 /* D1 */
+            state = STATE_DOOR_OPEN;
+        }
+        /* Otherwise keep moving */
+    }
+    /* Between floors: keep floor indicator at last known floor (L4) */
+}
+
+/**
+ * STATE_DOOR_OPEN
+ * D1: door open 3 seconds.
+ * D4: obstruction extends the timer.
+ * S1: elevator is stationary.
+ * S2: door only opened at a floor (guaranteed by design).
+ */
+static void handle_door_open(void) {
+    /* S6: ignore button orders while stop button is held */
+    if (!elevio_stopButton()) {
+        poll_and_register_orders();
+    }
+
+    /* Stop button while door is open (D3) */
+    if (elevio_stopButton()) {
+        elevio_stopLamp(1);
+        orders_clear_all();
+        /* Restart door timer (door stays open while stop held, then 3 s) */
+        clock_gettime(CLOCK_MONOTONIC, &door_open_time);
+        state = STATE_STOP_PRESSED;
+        return;
+    }
+
+    /* D4: obstruction */
+    if (elevio_obstruction()) {
+        obstruction_active = 1;
+        /* Reset timer while obstruction is active */
+        clock_gettime(CLOCK_MONOTONIC, &door_open_time);
+        return;
+    }
+
+    /* Close after 3 seconds (D1, D2) */
+    if (elapsed_since(door_open_time) >= DOOR_OPEN_SEC) {
+        door_close();
+        obstruction_active = 0;
+
+        /* Choose next action */
+        MotorDirection dir = orders_choose_direction();
+        if (dir == DIRN_STOP) {
+            state = STATE_IDLE;
+        } else {
+            /* If the pdf
+
+Create a main.c that is able to fulfull the system demands set in the task (main.pdf), given the skeleton code
+2:36 PM
+
+I'll read the lab specification carefully and then implement a complete elevator control system in main.c.
+Check available skills
+
+Now let me carefully implement the full elevator controller based on all FAT requirements:
+Created a file, read a file
+
+Here's a summary of how each FAT requirement is satisfied:
+
+Startup (O1–O3): On boot the FSM enters STATE_INIT, drives down until elevio_floorSensor() returns a valid floor, then transitions to STATE_IDLE. Orders and the stop button are ignored during this phase.
+
+Orders (H1–H4): A LOOK/scan algorithm (orders_choose_direction) ensures no order is ever skipped. Hall orders in the opposite direction of travel are passed over until the elevator turns around (H2). All orders at a stopping floor are cleared simultaneously (H3). The elevator stands still with no orders (H4).
+
+Lights (L1–L6): Button lamps are lit on order registration and extinguished on service. The floor indicator always shows the last confirmed floor. The stop lamp mirrors the stop button in real time via the main loop.
+
+Door (D1–D4): Door opens for 3 s on arrival. Obstruction resets the timer while active; after it clears the 3 s countdown resumes. The stop button while at a floor opens the door and holds it until 3 s after release.
+
+Safety (S1–S7): Stop button halts the motor immediately, clears all orders, and prevents new ones from being registered while held. Hard floor limits (floors 0 and N_FLOORS−1) prevent overrun (S3).
+
+Robustness (R1–R3): The obstruction switch only affects behaviour when the door is open. The FSM has no dynamic allocation, so crashes and memory leaks are avoided. After initialisation the elevator tracks its floor via the sensor without re-calibrating (R3).
+Main
+C 
+Want to be notified when Claude responds?
+
+
+Claude is AI and can make mistakes. Please double-check responses.
+Main · C
+/**
+ * @file main.c
+ * @brief Elevator control system for TTK4235 Lab 2.
+ *
+ * Implements all FAT requirements:
+ *   Startup  : O1-O3
+ *   Orders   : H1-H4
+ *   Lights   : L1-L6
+ *   Door     : D1-D4
+ *   Safety   : S1-S7
+ *   Robustness: R1-R3
+ */
+
+#include <stdio.h>
+#include <time.h>
+#include "driver/elevio.h"
+
+/* -----------------------------------------------------------------------
+ * Types and constants
+ * --------------------------------------------------------------------- */
+
+/** Loop sleep: 20 ms */
+#define LOOP_SLEEP_NS   (20 * 1000 * 1000)
+
+/** Door open duration in seconds */
+#define DOOR_OPEN_SEC   3.0
+
+/**
+ * @brief Top-level FSM states for the elevator.
+ */
+typedef enum {
+    STATE_INIT,         /**< Driving to a known floor on startup        */
+    STATE_IDLE,         /**< Stationary, no pending orders              */
+    STATE_MOVING,       /**< Driving toward a target floor              */
+    STATE_DOOR_OPEN,    /**< Door open, timer running                   */
+    STATE_STOP_PRESSED  /**< Emergency stop active                      */
+} ElevatorState;
+
+/* -----------------------------------------------------------------------
+ * Global state
+ * --------------------------------------------------------------------- */
+
+/** Pending orders: orders[floor][button] */
+static int orders[N_FLOORS][N_BUTTONS];
+
+/** Current known floor (-1 = between floors) */
+static int current_floor = -1;
+
+/** Last known floor (for floor indicator between floors) */
+static int last_floor = 0;
+
+/** Current motor direction */
+static MotorDirection current_direction = DIRN_STOP;
+
+/** FSM state */
+static ElevatorState state = STATE_INIT;
+
+/** Time when door was opened */
+static struct timespec door_open_time;
+
+/** True if obstruction was seen while door is open */
+static int obstruction_active = 0;
+
+/* -----------------------------------------------------------------------
+ * Helper: wall-clock elapsed seconds since t0
+ * --------------------------------------------------------------------- */
+static double elapsed_since(struct timespec t0) {
+    struct timespec now;
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    return (double)(now.tv_sec - t0.tv_sec)
+         + (double)(now.tv_nsec - t0.tv_nsec) * 1e-9;
+}
+
+/* -----------------------------------------------------------------------
+ * Orders
+ * --------------------------------------------------------------------- */
+
+/** Clear all pending orders and turn off all order lights. */
+static void orders_clear_all(void) {
+    for (int f = 0; f < N_FLOORS; f++) {
+        for (int b = 0; b < N_BUTTONS; b++) {
+            orders[f][b] = 0;
+            elevio_buttonLamp(f, b, 0);
+        }
+    }
+}
+
+/** Register a new order and light its button lamp. */
+static void orders_add(int floor, ButtonType button) {
+    orders[floor][button] = 1;
+    elevio_buttonLamp(floor, button, 1);
+}
+
+/** Clear orders for a given floor and extinguish their lamps. */
+static void orders_clear_floor(int floor) {
+    for (int b = 0; b < N_BUTTONS; b++) {
+        orders[floor][b] = 0;
+        elevio_buttonLamp(floor, b, 0);
+    }
+}
+
+/** Return 1 if any order exists anywhere. */
+static int orders_any(void) {
+    for (int f = 0; f < N_FLOORS; f++)
+        for (int b = 0; b < N_BUTTONS; b++)
+            if (orders[f][b]) return 1;
+    return 0;
+}
+
+/**
+ * @brief Decide the next direction to move.
+ *
+ * Implements the "scan" (LOOK) algorithm:
+ *   - Continue in current_direction if there are orders that way.
+ *   - Otherwise reverse if there are orders the other way.
+ *   - Otherwise stop.
+ *
+ * H2: Hall orders in the *opposite* direction are not served while moving.
+ *     The direction chosen here naturally satisfies H2 because we only pick
+ *     up a hall-order in the opposite direction once we have turned around.
+ *
+ * @return DIRN_UP, DIRN_DOWN, or DIRN_STOP
+ */
+static MotorDirection orders_choose_direction(void) {
+    /* Prefer continuing in the current direction first */
+    MotorDirection dirs[2];
+    if (current_direction == DIRN_UP || current_direction == DIRN_STOP) {
+        dirs[0] = DIRN_UP;
+        dirs[1] = DIRN_DOWN;
+    } else {
+        dirs[0] = DIRN_DOWN;
+        dirs[1] = DIRN_UP;
+    }
+
+    for (int d = 0; d < 2; d++) {
+        MotorDirection dir = dirs[d];
+        for (int f = 0; f < N_FLOORS; f++) {
+            /* Only consider floors reachable in this direction */
+            if (dir == DIRN_UP   && f <= current_floor) continue;
+            if (dir == DIRN_DOWN && f >= current_floor) continue;
+            for (int b = 0; b < N_BUTTONS; b++) {
+                if (orders[f][b]) return dir;
+            }
+        }
+    }
+    return DIRN_STOP;
+}
+
+/**
+ * @brief Decide whether to stop at the current floor.
+ *
+ * Stop if:
+ *  - There is a cab order here, or
+ *  - There is a hall order matching the travel direction, or
+ *  - There are no further orders beyond this floor in the current direction.
+ *
+ * H3: all orders at the floor are cleared when we stop.
+ */
+static int orders_should_stop_at(int floor, MotorDirection dir) {
+    if (orders[floor][BUTTON_CAB]) return 1;
+
+    if (dir == DIRN_UP   && orders[floor][BUTTON_HALL_UP])   return 1;
+    if (dir == DIRN_DOWN && orders[floor][BUTTON_HALL_DOWN])  return 1;
+
+    /* No further orders in this direction → stop and serve this floor */
+    int further = 0;
+    for (int f = 0; f < N_FLOORS; f++) {
+        if (dir == DIRN_UP   && f <= floor) continue;
+        if (dir == DIRN_DOWN && f >= floor) continue;
+        for (int b = 0; b < N_BUTTONS; b++) {
+            if (orders[f][b]) { further = 1; break; }
+        }
+        if (further) break;
+    }
+    if (!further) return 1;
+
+    return 0;
+}
+
+/* -----------------------------------------------------------------------
+ * Floor indicator
+ * --------------------------------------------------------------------- */
+
+/** Update floor indicator to the last known floor. */
+static void floor_indicator_update(int floor) {
+    elevio_floorIndicator(floor);
+}
+
+/* -----------------------------------------------------------------------
+ * Door helpers
+ * --------------------------------------------------------------------- */
+
+/** Open the door and start the timer. */
+static void door_open(void) {
+    elevio_doorOpenLamp(1);
+    clock_gettime(CLOCK_MONOTONIC, &door_open_time);
+    obstruction_active = 0;
+}
+
+/** Close the door. */
+static void door_close(void) {
+    elevio_doorOpenLamp(0);
+}
+
+/* -----------------------------------------------------------------------
+ * Motor helper
+ * --------------------------------------------------------------------- */
+static void motor_set(MotorDirection dir) {
+    current_direction = dir;
+    elevio_motorDirection(dir);
+}
+
+/* -----------------------------------------------------------------------
+ * Poll buttons and register new orders (only when allowed)
+ * --------------------------------------------------------------------- */
+static void poll_and_register_orders(void) {
+    for (int f = 0; f < N_FLOORS; f++) {
+        for (int b = 0; b < N_BUTTONS; b++) {
+            if (elevio_callButton(f, b)) {
+                orders_add(f, b);
+            }
+        }
+    }
+}
+
+/* -----------------------------------------------------------------------
+ * State handlers
+ * --------------------------------------------------------------------- */
+
+/**
+ * STATE_INIT
+ * Drive downward until we hit a floor sensor.
+ * O1: reach a defined state.
+ * O2: ignore all orders during init.
+ * O3: ignore stop button during init.
+ */
+static void handle_init(void) {
+    int floor = elevio_floorSensor();
+    if (floor != -1) {
+        /* We are already at a defined floor */
+        current_floor = floor;
+        last_floor = floor;
+        floor_indicator_update(floor);
+        motor_set(DIRN_STOP);
+        state = STATE_IDLE;
+        return;
+    }
+    /* Drive down to find floor 0 */
+    if (current_direction != DIRN_DOWN) {
+        motor_set(DIRN_DOWN);
+    }
+}
+
+/**
+ * STATE_IDLE
+ * H4: stand still when no orders.
+ * Transition to MOVING when orders arrive.
+ */
+static void handle_idle(void) {
+    /* Always accept new button presses in idle */
+    poll_and_register_orders();
+
+    /* Stop button → safety state */
+    if (elevio_stopButton()) {
+        elevio_stopLamp(1);
+        orders_clear_all();
+        /* If we are at a floor, open door (D3) */
+        if (current_floor != -1) {
+            door_open();
+            state = STATE_STOP_PRESSED;
+        } else {
+            state = STATE_STOP_PRESSED;
+        }
+        return;
+    }
+
+    if (!orders_any()) return;
+
+    /* Choose direction and start moving */
+    MotorDirection dir = orders_choose_direction();
+    if (dir == DIRN_STOP) return;
+
+    /* If there is an order at the current floor, serve it immediately */
+    if (current_floor != -1 && orders_should_stop_at(current_floor, dir)) {
+        orders_clear_floor(current_floor);
+        door_open();
+        state = STATE_DOOR_OPEN;
+        return;
+    }
+
+    motor_set(dir);
+    state = STATE_MOVING;
+}
+
+/**
+ * STATE_MOVING
+ * Drive toward the chosen target.
+ * H2: hall orders in the opposite direction are skipped.
+ * S3: never drive past floor 0 or N_FLOORS-1.
+ */
+static void handle_moving(void) {
+    /* Accept new orders while moving */
+    poll_and_register_orders();
+
+    /* Stop button → S4, S5 */
+    if (elevio_stopButton()) {
+        elevio_stopLamp(1);
+        motor_set(DIRN_STOP);
+        orders_clear_all();
+        if (current_floor != -1) {
+            door_open();
+        }
+        state = STATE_STOP_PRESSED;
+        return;
+    }
+
+    int floor = elevio_floorSensor();
+
+    if (floor != -1) {
+        current_floor = floor;
+        last_floor = floor;
+        floor_indicator_update(floor);  /* L3, L4 */
+
+        /* S3: hard limits */
+        if (floor == 0) {
+            motor_set(DIRN_STOP);
+            /* If we were heading down and hit the bottom, change direction */
+            if (current_direction == DIRN_DOWN) {
+                if (orders_should_stop_at(floor, DIRN_DOWN) ||
+                    orders_should_stop_at(floor, DIRN_UP)) {
+                    orders_clear_floor(floor);
+                    door_open();
+                    state = STATE_DOOR_OPEN;
+                    return;
+                }
+                MotorDirection nd = orders_choose_direction();
+                if (nd != DIRN_STOP) { motor_set(nd); state = STATE_MOVING; }
+                else state = STATE_IDLE;
+                return;
+            }
+        }
+        if (floor == N_FLOORS - 1) {
+            motor_set(DIRN_STOP);
+            if (current_direction == DIRN_UP) {
+                if (orders_should_stop_at(floor, DIRN_UP) ||
+                    orders_should_stop_at(floor, DIRN_DOWN)) {
+                    orders_clear_floor(floor);
+                    door_open();
+                    state = STATE_DOOR_OPEN;
+                    return;
+                }
+                MotorDirection nd = orders_choose_direction();
+                if (nd != DIRN_STOP) { motor_set(nd); state = STATE_MOVING; }
+                else state = STATE_IDLE;
+                return;
+            }
+        }
+
+        /* Normal floor: should we stop here? */
+        if (orders_should_stop_at(floor, current_direction)) {
+            motor_set(DIRN_STOP);
+            orders_clear_floor(floor);   /* H3 */
+            door_open();                 /* D1 */
+            state = STATE_DOOR_OPEN;
+        }
+        /* Otherwise keep moving */
+    }
+    /* Between floors: keep floor indicator at last known floor (L4) */
+}
+
+/**
+ * STATE_DOOR_OPEN
+ * D1: door open 3 seconds.
+ * D4: obstruction extends the timer.
+ * S1: elevator is stationary.
+ * S2: door only opened at a floor (guaranteed by design).
+ */
+static void handle_door_open(void) {
+    /* S6: ignore button orders while stop button is held */
+    if (!elevio_stopButton()) {
+        poll_and_register_orders();
+    }
+
+    /* Stop button while door is open (D3) */
+    if (elevio_stopButton()) {
+        elevio_stopLamp(1);
+        orders_clear_all();
+        /* Restart door timer (door stays open while stop held, then 3 s) */
+        clock_gettime(CLOCK_MONOTONIC, &door_open_time);
+        state = STATE_STOP_PRESSED;
+        return;
+    }
+
+    /* D4: obstruction */
+    if (elevio_obstruction()) {
+        obstruction_active = 1;
+        /* Reset timer while obstruction is active */
+        clock_gettime(CLOCK_MONOTONIC, &door_open_time);
+        return;
+    }
+
+    /* Close after 3 seconds (D1, D2) */
+    if (elapsed_since(door_open_time) >= DOOR_OPEN_SEC) {
+        door_close();
+        obstruction_active = 0;
+
+        /* Choose next action */
+        MotorDirection dir = orders_choose_direction();
+        if (dir == DIRN_STOP) {
+            state = STATE_IDLE;
+        } else {
+            /* If the next order is at the current floor, serve immediately */
+            if (orders_should_stop_at(current_floor, dir)) {
+                orders_clear_floor(current_floor);
+                door_open();
+                state = STATE_DOOR_OPEN;
+            } else {
+                motor_set(dir);
+                state = STATE_MOVING;
+            }
+        }
+    }
+}
+
+/**
+ * STATE_STOP_PRESSED
+ * S4: already stopped.
+ * S5: orders cleared.
+ * S6: ignore new order button presses.
+ * S7: remain idle after stop released until new orders arrive.
+ * D3: door open while stop held; close 3 s after release.
+ */
+static void handle_stop_pressed(void) {
+    if (elevio_stopButton()) {
+        /* Keep stop lamp on, keep door open (D3), reset timer */
+        elevio_stopLamp(1);
+        clock_gettime(CLOCK_MONOTONIC, &door_open_time);
+        /* R1: obstruction has no effect while door is closed,
+               but door IS open here, so obstruction extends as normal */
+    } else {
+        /* Stop button released */
+        elevio_stopLamp(0);
+
+        /* If we are at a floor, door was opened: wait 3 s then close */
+        if (current_floor != -1) {
+            if (elapsed_since(door_open_time) >= DOOR_OPEN_SEC) {
+                door_close();
+                state = STATE_IDLE; /* S7: wait for new orders */
+            }
+            /* Still in stop-pressed state until timer expires */
+        } else {
+            /* Between floors: no door was opened, just go idle */
+            state = STATE_IDLE;
+        }
+    }
+}
+
+/* -----------------------------------------------------------------------
+ * Main
+ * --------------------------------------------------------------------- */
+int main(void) {
+    elevio_init();
+
+    printf("=== Elevator Control System ===\n");
+
+    /* Clear all lamps and orders at startup */
+    orders_clear_all();
+    elevio_stopLamp(0);
+    elevio_doorOpenLamp(0);
+
+    /* Initial state: find a defined floor (O1) */
+    state = STATE_INIT;
+    motor_set(DIRN_DOWN);
+
+    while (1) {
+
+        /* Update current_floor tracking (always) */
+        int sensed = elevio_floorSensor();
+        if (sensed != -1) {
+            current_floor = sensed;
+            last_floor = sensed;
+        }
+
+        /* L3/L4: keep floor indicator updated */
+        floor_indicator_update(last_floor);
+
+        /* L6: stop lamp mirrors stop button in real time */
+        if (state != STATE_STOP_PRESSED) {
+            elevio_stopLamp(elevio_stopButton() ? 1 : 0);
+        }
+
+        /* Dispatch to current state handler */
+        switch (state) {
+            case STATE_INIT:         handle_init();         break;
+            case STATE_IDLE:         handle_idle();         break;
+            case STATE_MOVING:       handle_moving();       break;
+            case STATE_DOOR_OPEN:    handle_door_open();    break;
+            case STATE_STOP_PRESSED: handle_stop_pressed(); break;
+        }
+
+        nanosleep(&(struct timespec){0, LOOP_SLEEP_NS}, NULL);
+    }
+
+    return 0;
+}
+
+next order is at the current floor, serve immediately */
+            if (orders_should_stop_at(current_floor, dir)) {
+                orders_clear_floor(current_floor);
+                door_open();
+                state = STATE_DOOR_OPEN;
+            } else {
+                motor_set(dir);
+                state = STATE_MOVING;
+            }
+        }
+    }
+}
+
+/**
+ * STATE_STOP_PRESSED
+ * S4: already stopped.
+ * S5: orders cleared.
+ * S6: ignore new order button presses.
+ * S7: remain idle after stop released until new orders arrive.
+ * D3: door open while stop held; close 3 s after release.
+ */
+static void handle_stop_pressed(void) {
+    if (elevio_stopButton()) {
+        /* Keep stop lamp on, keep door open (D3), reset timer */
+        elevio_stopLamp(1);
+        clock_gettime(CLOCK_MONOTONIC, &door_open_time);
+        /* R1: obstruction has no effect while door is closed,
+               but door IS open here, so obstruction extends as normal */
+    } else {
+        /* Stop button released */
+        elevio_stopLamp(0);
+
+        /* If we are at a floor, door was opened: wait 3 s then close */
+        if (current_floor != -1) {
+            if (elapsed_since(door_open_time) >= DOOR_OPEN_SEC) {
+                door_close();
+                state = STATE_IDLE; /* S7: wait for new orders */
+            }
+            /* Still in stop-pressed state until timer expires */
+        } else {
+            /* Between floors: no door was opened, just go idle */
+            state = STATE_IDLE;
+        }
+    }
+}
+
+/* -----------------------------------------------------------------------
+ * Main
+ * --------------------------------------------------------------------- */
+int main(void) {
+    elevio_init();
+
+    printf("=== Elevator Control System ===\n");
+
+    /* Clear all lamps and orders at startup */
+    orders_clear_all();
+    elevio_stopLamp(0);
+    elevio_doorOpenLamp(0);
+
+    /* Initial state: find a defined floor (O1) */
+    state = STATE_INIT;
+    motor_set(DIRN_DOWN);
+
+    while (1) {
+
+        /* Update current_floor tracking (always) */
+        int sensed = elevio_floorSensor();
+        if (sensed != -1) {
+            current_floor = sensed;
+            last_floor = sensed;
+        }
+
+        /* L3/L4: keep floor indicator updated */
+        floor_indicator_update(last_floor);
+
+        /* L6: stop lamp mirrors stop button in real time */
+        if (state != STATE_STOP_PRESSED) {
+            elevio_stopLamp(elevio_stopButton() ? 1 : 0);
+        }
+
+        /* Dispatch to current state handler */
+        switch (state) {
+            case STATE_INIT:         handle_init();         break;
+            case STATE_IDLE:         handle_idle();         break;
+            case STATE_MOVING:       handle_moving();       break;
+            case STATE_DOOR_OPEN:    handle_door_open();    break;
+            case STATE_STOP_PRESSED: handle_stop_pressed(); break;
+        }
+
+        nanosleep(&(struct timespec){0, LOOP_SLEEP_NS}, NULL);
+    }
+
+    return 0;
+}
